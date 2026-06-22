@@ -15,10 +15,15 @@
  */
 package io.valkey.springframework.data.valkey.connection.valkeyglide;
 
+import java.util.Collections;
+import java.util.Iterator;
 import java.util.List;
+import java.util.NoSuchElementException;
 
 import org.springframework.dao.InvalidDataAccessApiUsageException;
 
+import glide.api.models.GlideString;
+import glide.api.models.commands.scan.ClusterScanCursor;
 import io.valkey.springframework.data.valkey.connection.ClusterSlotHashUtil;
 import io.valkey.springframework.data.valkey.connection.ValkeyKeyCommands;
 import io.valkey.springframework.data.valkey.connection.SortParameters;
@@ -52,9 +57,139 @@ public class ValkeyGlideClusterKeyCommands extends ValkeyGlideKeyCommands {
 
     @Override
     public Cursor<byte[]> scan(ScanOptions options) {
-        // TODO: https://github.com/valkey-io/spring-data-valkey/issues/21
-		throw new InvalidDataAccessApiUsageException("Scan is not supported across multiple nodes within a cluster");
+		ScanOptions scanOptions = options != null ? options : ScanOptions.NONE;
+
+		// Node-scoped cluster scan sets a one-shot route before calling this method.
+		// Keep using the SCAN command path so routing semantics remain unchanged.
+		if (connection.getClusterAdapter().hasOneShotRouteForNextCommand()) {
+			return super.scan(scanOptions);
+		}
+
+		return new ValkeyGlideClusterScanCursor(connection, scanOptions);
     }
+
+	private static class ValkeyGlideClusterScanCursor implements Cursor<byte[]> {
+
+		private final ValkeyGlideClusterConnection connection;
+		private final ScanOptions scanOptions;
+		private ClusterScanCursor cursorState = ClusterScanCursor.initialCursor();
+		private Iterator<byte[]> currentBatch = Collections.emptyIterator();
+		private long position = 0;
+		private boolean finished = false;
+		private boolean closed = false;
+
+		private ValkeyGlideClusterScanCursor(ValkeyGlideClusterConnection connection, ScanOptions scanOptions) {
+			this.connection = connection;
+			this.scanOptions = scanOptions;
+		}
+
+		@Override
+		public long getCursorId() {
+			return position;
+		}
+
+		@Override
+		public CursorId getId() {
+			return CursorId.of(String.valueOf(position));
+		}
+
+		@Override
+		public boolean hasNext() {
+			if (closed) {
+				return false;
+			}
+
+			if (currentBatch.hasNext()) {
+				return true;
+			}
+
+			while (!finished) {
+				loadNextBatch();
+				if (currentBatch.hasNext()) {
+					return true;
+				}
+			}
+
+			return false;
+		}
+
+		@Override
+		public byte[] next() {
+			if (!hasNext()) {
+				throw new NoSuchElementException();
+			}
+			return currentBatch.next();
+		}
+
+		@Override
+		public void close() {
+			closed = true;
+			finished = true;
+			currentBatch = Collections.emptyIterator();
+			cursorState.releaseCursorHandle();
+		}
+
+		@Override
+		public long getPosition() {
+			return position;
+		}
+
+		@Override
+		public boolean isClosed() {
+			return closed;
+		}
+
+		private void loadNextBatch() {
+			if (connection.isQueueing() || connection.isPipelined()) {
+				throw new InvalidDataAccessApiUsageException("'SCAN' cannot be called in pipeline / transaction mode");
+			}
+
+			try {
+				ClusterGlideClientAdapter adapter = connection.getClusterAdapter();
+				Object[] scanResult = hasScanOptions(scanOptions)
+						? adapter.scan(cursorState, toGlideScanOptions(scanOptions))
+						: adapter.scan(cursorState);
+
+				if (scanResult == null || scanResult.length < 2 || !(scanResult[0] instanceof ClusterScanCursor)) {
+					finished = true;
+					currentBatch = Collections.emptyIterator();
+					return;
+				}
+
+				cursorState = (ClusterScanCursor) scanResult[0];
+				finished = cursorState.isFinished();
+
+				List<byte[]> keys = ValkeyGlideConverters.toBytesList(scanResult[1]);
+				position += keys.size();
+				currentBatch = keys.iterator();
+			} catch (InterruptedException ex) {
+				Thread.currentThread().interrupt();
+				throw new IllegalStateException("Interrupted while scanning cluster", ex);
+			} catch (Exception ex) {
+				throw new ValkeyGlideExceptionConverter().convert(ex);
+			}
+		}
+
+		private static boolean hasScanOptions(ScanOptions options) {
+			return options.getCount() != null || options.getPattern() != null || options.getBytePattern() != null;
+		}
+
+		private static glide.api.models.commands.scan.ScanOptions toGlideScanOptions(ScanOptions options) {
+			var builder = glide.api.models.commands.scan.ScanOptions.builder();
+
+			if (options.getBytePattern() != null) {
+				builder.matchPatternBinary(GlideString.of(options.getBytePattern()));
+			} else if (options.getPattern() != null) {
+				builder.matchPattern(options.getPattern());
+			}
+
+			if (options.getCount() != null) {
+				builder.count(options.getCount());
+			}
+
+			return builder.build();
+		}
+	}
 
     @Override
 	public Boolean move(byte[] key, int dbIndex) {
