@@ -84,7 +84,7 @@ ValkeyCacheManager cacheManager = ValkeyCacheManager
 The `KEYS` batch strategy is fully supported using any driver and Valkey operation mode (Standalone, Clustered).
 :::
 
-`SCAN` is fully supported when using the Lettuce driver.
+`SCAN` is fully supported when using the Valkey GLIDE or Lettuce driver.
 Jedis supports `SCAN` only in non-clustered modes.
 Valkey GLIDE supports `SCAN` in standalone mode and cluster mode.
 
